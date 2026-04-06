@@ -4,7 +4,6 @@
  * Polls pgmq scoring_jobs queue and processes large recording scoring jobs.
  * Designed for EasyPanel deployment.
  */
-
 import { readQueue, deleteMessage, updateCallScore, deleteScoreDetails, insertScoreDetails, shutdown } from './db';
 import { startHealthServer, recordPoll, recordJobDone, recordJobFailed } from './health';
 import { analyzeAudioWithGemini, buildScoringPrompt, callAI } from './scoring';
@@ -16,6 +15,51 @@ const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
 let running = true;
+
+// ── Safe JSON parser with repair ──
+function safeParseJSON(raw: string): any {
+  // Strip markdown fences
+  let cleaned = raw.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim();
+
+  // If it starts with a markdown heading, try to extract JSON from it
+  if (cleaned.startsWith('#')) {
+    const jsonStart = cleaned.indexOf('{');
+    if (jsonStart !== -1) {
+      cleaned = cleaned.slice(jsonStart);
+    }
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (_firstErr) {
+    console.warn('JSON parse failed, attempting repair...');
+
+    // Remove trailing commas before ] or }
+    let repaired = cleaned.replace(/,\s*([}\]])/g, '$1');
+
+    // Balance quotes
+    const quoteCount = (repaired.match(/(?<!\\)"/g) || []).length;
+    if (quoteCount % 2 !== 0) repaired += '"';
+
+    // Balance brackets and braces
+    const openBrackets = (repaired.match(/\[/g) || []).length;
+    const closeBrackets = (repaired.match(/]/g) || []).length;
+    const openBraces = (repaired.match(/{/g) || []).length;
+    const closeBraces = (repaired.match(/}/g) || []).length;
+
+    repaired += ']'.repeat(Math.max(0, openBrackets - closeBrackets));
+    repaired += '}'.repeat(Math.max(0, openBraces - closeBraces));
+
+    try {
+      const result = JSON.parse(repaired);
+      console.log('JSON repair successful');
+      return result;
+    } catch (repairErr) {
+      console.error('JSON repair also failed. First 500 chars:', cleaned.slice(0, 500));
+      throw repairErr;
+    }
+  }
+}
 
 async function processJob(job: any): Promise<void> {
   const msg = job.message;
@@ -51,10 +95,8 @@ async function processJob(job: any): Promise<void> {
 
   // 2. Score transcript
   const { system, user } = buildScoringPrompt(transcript, rubric, call_context, audioDelivery);
-
   const rawResult = await callAI(user, system, scoring_api_key, scoring_model, scoring_provider);
-  const cleaned = rawResult.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim();
-  const scoringResult = JSON.parse(cleaned);
+  const scoringResult = safeParseJSON(rawResult);
 
   // 3. Write results
   const overallScore = scoringResult.overall_score || 0;
@@ -91,7 +133,6 @@ async function processJob(job: any): Promise<void> {
   // Insert step details
   if (scoringResult.step_scores && Array.isArray(scoringResult.step_scores)) {
     await deleteScoreDetails(call_score_id);
-
     const details = scoringResult.step_scores.map((step: any) => ({
       call_score_id,
       step_key: step.step_key,
@@ -104,13 +145,11 @@ async function processJob(job: any): Promise<void> {
       key_phrases_hit: step.key_phrases_hit ?? null,
       key_phrases_missed: step.key_phrases_missed ?? null,
     }));
-
     await insertScoreDetails(details);
   }
 
   // 4. Trigger Slack alert (fire-and-forget)
   const scorePercentage = maxPossible > 0 ? Math.round((overallScore / maxPossible) * 100) : 0;
-
   try {
     await fetch(`${SUPABASE_URL}/functions/v1/send-slack-alert`, {
       method: 'POST',

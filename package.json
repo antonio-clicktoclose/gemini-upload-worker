@@ -1,0 +1,23 @@
+{
+  "name": "scoring-worker",
+  "version": "1.0.0",
+  "description": "External scoring worker for large call recordings",
+  "main": "dist/worker.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/worker.js",
+    "dev": "ts-node src/worker.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "express": "^4.21.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@types/express": "^5.0.0",
+    "ts-node": "^10.9.2"
+  }
+}

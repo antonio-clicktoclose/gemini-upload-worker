@@ -31,18 +31,18 @@ export interface QueueMessage {
 
 export async function readQueue(visibilityTimeoutS: number): Promise<QueueMessage | null> {
   const result = await query(
-    `SELECT * FROM pgmq.read('scoring_jobs', $1, 1)`,
+    `SELECT * FROM pgmq.read('scoring_jobs'::text, $1::integer, 1)`,
     [visibilityTimeoutS]
   );
   return result.rows.length > 0 ? result.rows[0] : null;
 }
 
 export async function deleteMessage(msgId: string): Promise<void> {
-  await query(`SELECT pgmq.delete('scoring_jobs', $1)`, [BigInt(msgId)]);
+  await query(`SELECT pgmq.delete('scoring_jobs'::text, $1::bigint)`, [msgId]);
 }
 
 export async function archiveMessage(msgId: string): Promise<void> {
-  await query(`SELECT pgmq.archive('scoring_jobs', $1)`, [BigInt(msgId)]);
+  await query(`SELECT pgmq.archive('scoring_jobs'::text, $1::bigint)`, [msgId]);
 }
 
 // ── call_scores / call_score_details writes ──
@@ -63,16 +63,13 @@ export async function deleteScoreDetails(callScoreId: string): Promise<void> {
 
 export async function insertScoreDetails(details: Record<string, any>[]): Promise<void> {
   if (details.length === 0) return;
-
   const columns = [
     'call_score_id', 'step_key', 'step_label', 'score', 'max_score',
     'reasoning', 'evidence', 'adherence_percentage', 'key_phrases_hit', 'key_phrases_missed'
   ];
-
   const valuePlaceholders: string[] = [];
   const values: any[] = [];
   let idx = 1;
-
   for (const d of details) {
     const placeholders = columns.map(() => `$${idx++}`);
     valuePlaceholders.push(`(${placeholders.join(', ')})`);
@@ -84,7 +81,6 @@ export async function insertScoreDetails(details: Record<string, any>[]): Promis
       d.key_phrases_missed ? JSON.stringify(d.key_phrases_missed) : null
     );
   }
-
   await query(
     `INSERT INTO public.call_score_details (${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`,
     values

@@ -2,8 +2,42 @@
  * Scoring logic ported directly from supabase/functions/score-sales-call/index.ts
  * Includes: callAI, analyzeAudioWithGemini, buildScoringPrompt
  */
-
 import { downloadToTmp, uploadToGemini, waitForActive, deleteGeminiFile, cleanupTmpFile, detectMimeType } from './gemini';
+
+// ── Safe JSON parser with repair ──
+function safeParseJSON(raw: string): any {
+  let cleaned = raw.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim();
+
+  if (cleaned.startsWith('#')) {
+    const jsonStart = cleaned.indexOf('{');
+    if (jsonStart !== -1) {
+      cleaned = cleaned.slice(jsonStart);
+    }
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (_firstErr) {
+    console.warn('JSON parse failed, attempting repair...');
+    let repaired = cleaned.replace(/,\s*([}\]])/g, '$1');
+    const quoteCount = (repaired.match(/(?<!\\)"/g) || []).length;
+    if (quoteCount % 2 !== 0) repaired += '"';
+    const openBrackets = (repaired.match(/\[/g) || []).length;
+    const closeBrackets = (repaired.match(/]/g) || []).length;
+    const openBraces = (repaired.match(/{/g) || []).length;
+    const closeBraces = (repaired.match(/}/g) || []).length;
+    repaired += ']'.repeat(Math.max(0, openBrackets - closeBrackets));
+    repaired += '}'.repeat(Math.max(0, openBraces - closeBraces));
+    try {
+      const result = JSON.parse(repaired);
+      console.log('JSON repair successful');
+      return result;
+    } catch (repairErr) {
+      console.error('JSON repair also failed. First 500 chars:', cleaned.slice(0, 500));
+      throw repairErr;
+    }
+  }
+}
 
 // ============================================================
 // AI CALL HELPERS
@@ -20,7 +54,7 @@ export async function callAI(
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model, max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: 16384, system: systemPrompt, messages: [{ role: 'user', content: prompt }] }),
     });
     if (!resp.ok) throw new Error(`Anthropic error: ${resp.status} ${await resp.text()}`);
     const data: any = await resp.json();
@@ -33,7 +67,7 @@ export async function callAI(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model, max_tokens: 4096,
+        model, max_tokens: 16384,
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
       }),
@@ -52,7 +86,7 @@ export async function callAI(
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 4096, responseMimeType: 'application/json' },
+          generationConfig: { maxOutputTokens: 16384, responseMimeType: 'application/json' },
         }),
       },
     );
@@ -82,6 +116,7 @@ export async function analyzeAudioWithGemini(
 You MUST analyze what you actually hear${isVideo ? ' and see' : ''} — do not fabricate or guess.
 
 Return this exact JSON structure:
+
 {
   "tone": "warm/neutral/aggressive/monotone/enthusiastic",
   "pacing": "too_fast/good/too_slow/varied",
@@ -163,7 +198,7 @@ IMPORTANT: The "verification" block is critical — report what you actually hea
               { fileData: { mimeType, fileUri } },
             ],
           }],
-          generationConfig: { maxOutputTokens: 8192, responseMimeType: 'application/json' },
+          generationConfig: { maxOutputTokens: 16384, responseMimeType: 'application/json' },
         }),
       },
     );
@@ -175,10 +210,14 @@ IMPORTANT: The "verification" block is critical — report what you actually hea
     }
 
     const data: any = await resp.json();
-    const result = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const result = safeParseJSON(rawText);
+
     console.log('GEMINI VERIFICATION:', JSON.stringify(result.verification || null));
+
     const { verification: _v, ...cleanResult } = result;
     return cleanResult;
+
   } catch (err) {
     console.error('Audio analysis failed:', err);
     return null;
@@ -206,6 +245,7 @@ export function buildScoringPrompt(
   let system = `You are an expert sales call scoring analyst. Score the following call transcript against the provided rubric framework.
 
 Return a JSON object with exactly this structure:
+
 {
   "step_scores": [
     {
@@ -304,9 +344,11 @@ Summary: ${audioInsights.delivery_summary || audioInsights.delivery_notes || 'N/
     if (audioInsights.critical_moments?.length) {
       user += `\n\nCritical Moments:\n${audioInsights.critical_moments.map((m: any) => `- [${m.timestamp}] ${m.type}: ${m.description} (${m.rep_response_quality})`).join('\n')}`;
     }
+
     if (audioInsights.emotional_shifts?.length) {
       user += `\n\nEmotional Shifts:\n${audioInsights.emotional_shifts.map((s: any) => `- [${s.timestamp}] ${s.shift} — ${s.trigger}`).join('\n')}`;
     }
+
     if (audioInsights.visual_analysis) {
       const v = audioInsights.visual_analysis;
       user += `\n\nVisual: Eye contact=${v.eye_contact_quality}, Body=${v.body_language}, Professional=${v.professionalism}`;
@@ -314,5 +356,6 @@ Summary: ${audioInsights.delivery_summary || audioInsights.delivery_notes || 'N/
   }
 
   user += `\n\n## Transcript\n${truncated}`;
+
   return { system, user };
 }

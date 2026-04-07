@@ -1,12 +1,11 @@
-FROM node:20-alpine
-
-# Install ffmpeg for audio extraction (audio_only mode)
-RUN apk add --no-cache ffmpeg
+FROM node:20
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm ci --production
+COPY package.json ./
+RUN npm install --production
+
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 

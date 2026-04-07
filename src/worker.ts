@@ -132,22 +132,38 @@ async function pgmqRead(): Promise<any | null> {
     return null;
   }
 
-  const rows = await res.json() as any[];
+  const rows = await res.json() as Array<{
+    msg_id: number;
+    read_ct: number;
+    enqueued_at: string;
+    vt: string;
+    message: any;
+    headers?: any;
+  }>;
+
   return rows?.[0] || null;
 }
 
 async function pgmqDelete(msgId: number): Promise<void> {
-  await supabaseFetch('/rest/v1/rpc/pgmq_delete', {
+  const res = await supabaseFetch('/rest/v1/rpc/pgmq_delete', {
     method: 'POST',
     body: JSON.stringify({ queue_name: 'scoring_jobs', msg_id: msgId }),
   });
+
+  if (!res.ok) {
+    console.error('pgmq_delete error:', await res.text());
+  }
 }
 
 async function pgmqArchive(msgId: number): Promise<void> {
-  await supabaseFetch('/rest/v1/rpc/pgmq_archive', {
+  const res = await supabaseFetch('/rest/v1/rpc/pgmq_archive', {
     method: 'POST',
     body: JSON.stringify({ queue_name: 'scoring_jobs', msg_id: msgId }),
   });
+
+  if (!res.ok) {
+    console.error('pgmq_archive error:', await res.text());
+  }
 }
 
 async function updateCallScore(scoreId: string, updates: Record<string, any>): Promise<void> {

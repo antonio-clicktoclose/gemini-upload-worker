@@ -164,6 +164,40 @@ function extractJSON(raw: string): any {
 }
 
 // ============================================================
+// COACHING DATA NORMALIZER
+// ============================================================
+
+function splitPlainStringToIssueFix(text: string): { issue: string; fix: string; script_reference: string | null } {
+  const separators = ['Instead:', 'Fix:', '->', '→', ' — '];
+  for (const sep of separators) {
+    const idx = text.indexOf(sep);
+    if (idx > 0) {
+      return {
+        issue: text.substring(0, idx).trim(),
+        fix: text.substring(idx + sep.length).trim(),
+        script_reference: null,
+      };
+    }
+  }
+  return { issue: text, fix: '', script_reference: null };
+}
+
+function normalizeCoachingData(scoringResult: any): void {
+  if (scoringResult.coaching_fixes && Array.isArray(scoringResult.coaching_fixes)) {
+    scoringResult.coaching_fixes = scoringResult.coaching_fixes.map((fix: any) => {
+      if (typeof fix === 'string') return splitPlainStringToIssueFix(fix);
+      return fix;
+    });
+  }
+  if (typeof scoringResult.deal_killer === 'string') {
+    scoringResult.deal_killer = { summary: scoringResult.deal_killer, timestamp: null, quote: null, what_to_do_instead: null };
+  }
+  if (typeof scoringResult.assigned_drill === 'string') {
+    scoringResult.assigned_drill = { name: scoringResult.assigned_drill, why: null };
+  }
+}
+
+// ============================================================
 // SUPABASE HELPERS
 // ============================================================
 
@@ -313,26 +347,39 @@ ${isAudioOnly ? 'This upload is audio-only. Do NOT infer camera presence, eye co
 
 Return a JSON object with these fields:
 {
-  "delivery_grade": "A-F letter grade",
-  "delivery_summary": "one sentence summary of delivery quality",
-  "tone": "description of tone",
-  "energy_level": "low/medium/high",
-  "vocal_confidence": "description",
-  "pacing": "description",
-  "enthusiasm_level": "low/medium/high",
-  "rapport_quality": "description",
-  "voice_variation": "description",
-  "talk_to_listen_ratio": "e.g. 60:40",
-  "filler_word_count": number,
-  "strategic_pauses": number,
-  "interruption_count": number,
-  "emotional_shifts": [{"timestamp": "MM:SS", "from_emotion": "", "to_emotion": "", "trigger": ""}],
-  "critical_moments": [{"timestamp": "MM:SS", "description": "", "impact": "positive/negative"}],
-  "visual_analysis": ${isAudioOnly ? 'null' : '{"eye_contact": "", "environment": "", "body_language": ""}'},
-  "engagement_timeline": [{"timestamp": "MM:SS", "engagement_level": 1, "note": ""}],
-  "active_listening_signals": [""],
-  "monologue_flags": [{"timestamp": "MM:SS", "duration_seconds": 0, "speaker": ""}]
+  "delivery_grade": "A/B/C/D/F",
+  "delivery_summary": "2-3 sentence summary of overall delivery quality including vocal presence, emotional intelligence, and conversation control",
+  "tone": "warm/neutral/aggressive/monotone/enthusiastic",
+  "energy_level": "high/medium/low",
+  "vocal_confidence": "high/medium/low",
+  "pacing": "too_fast/good/too_slow/varied",
+  "enthusiasm_level": "high/medium/low",
+  "rapport_quality": "strong/moderate/weak/none",
+  "voice_variation": "dynamic/moderate/flat",
+  "talk_to_listen_ratio": 0.65,
+  "filler_word_count": 12,
+  "filler_examples": ["um at 1:23", "uh at 3:45", "like at 5:02"],
+  "strategic_pauses": 3,
+  "interruption_count": { "rep": 2, "prospect": 1 },
+  "emotional_shifts": [{"timestamp": "MM:SS", "shift": "warm→defensive", "trigger": "price objection raised"}],
+  "critical_moments": [{"timestamp": "MM:SS", "type": "objection_raised/rapport_peak/energy_drop/closing_attempt/breakthrough", "description": "What happened", "rep_response_quality": "excellent/good/fair/poor"}],
+  "visual_analysis": ${isAudioOnly ? 'null' : '{"eye_contact_quality": "strong/moderate/poor", "body_language": "open/neutral/closed", "professionalism": "high/medium/low", "environment_notes": "description", "notable_gestures": ["nodded at 3:45"]}'},
+  "engagement_timeline": [{"minute": 1, "rep_energy": "high/medium/low", "prospect_engagement": "high/medium/low/disengaged", "notes": "brief note"}],
+  "active_listening_signals": ["mmhm at 3:20", "repeated prospect's words at 4:10"],
+  "monologue_flags": ["2:30-4:15 rep spoke for 1m45s without pause"],
+  "delivery_notes": "Brief overall delivery assessment"
 }
+
+IMPORTANT RULES:
+- engagement_timeline should have one entry per minute of the call (up to 60 entries max).
+- critical_moments should capture 3-8 key turning points.
+- filler_examples: list up to 10 most notable instances with timestamps.
+- emotional_shifts: only include genuine shifts you detect, not every moment.
+- Only return the JSON object, no other text.
+- FORMAT ENFORCEMENT: For tone/pacing/energy_level/vocal_confidence/rapport_quality/voice_variation/enthusiasm_level, return ONLY the single-word or short label from the options shown in the schema (e.g. "warm", "good", "high") — NEVER return a full sentence or paragraph.
+- talk_to_listen_ratio MUST be a decimal number (e.g. 0.65), NOT a string like "65:35".
+- interruption_count MUST be an object {"rep": N, "prospect": N}, NEVER a plain number.
+- filler_word_count and strategic_pauses MUST be plain integers, not strings.
 
 CRITICAL OUTPUT FORMAT: Return ONLY the raw JSON object. Do NOT include markdown headers, code fences, or any text before or after the JSON.`;
 }
@@ -346,11 +393,44 @@ function buildScoringSystemPrompt(rubric: Record<string, any>, callContext: Reco
     })
     .join('\n');
 
-  const audioContext = audioDelivery
-    ? `\n\nAudio/Video Delivery Analysis Available:\n${JSON.stringify(audioDelivery, null, 2)}\n\nUse this delivery data to inform your scoring, especially for confidence, engagement, and objection handling.`
-    : '';
+  let audioContext = '';
+  if (audioDelivery) {
+    audioContext = `\n\nAudio/Video Delivery Analysis Available:
+Delivery Grade: ${audioDelivery.delivery_grade || 'N/A'}
+Vocal Confidence: ${audioDelivery.vocal_confidence || 'N/A'}
+Tone: ${audioDelivery.tone || 'N/A'}
+Energy: ${audioDelivery.energy_level || 'N/A'}
+Rapport Quality: ${audioDelivery.rapport_quality || 'N/A'}
+Filler Words: ${audioDelivery.filler_word_count ?? 'N/A'}
+Enthusiasm: ${audioDelivery.enthusiasm_level || 'N/A'}
+Interruptions (rep/prospect): ${audioDelivery.interruption_count ? `${audioDelivery.interruption_count.rep}/${audioDelivery.interruption_count.prospect}` : 'N/A'}
+Strategic Pauses: ${audioDelivery.strategic_pauses ?? 'N/A'}
+Talk-to-Listen Ratio: ${audioDelivery.talk_to_listen_ratio ?? 'N/A'}
+Delivery Summary: ${audioDelivery.delivery_summary || audioDelivery.delivery_notes || 'N/A'}
 
-  return `You are a sales call scoring expert. Score this call using the "${rubric.name}" framework.
+IMPORTANT: Factor these delivery insights into your scoring:
+- A rep who says the right words but delivers them poorly (low confidence, flat energy, no rapport) should score LOWER.
+- Strong delivery can elevate scores for steps where the rep showed genuine engagement and authority.
+- SILENCE DISCIPLINE: Check strategic_pauses count. If strategic_pauses = 0 after close attempts or price reveals, this is a critical failure.
+- TALK RATIO: If talk_to_listen_ratio > 0.45, the rep is talking too much. Flag and penalize discovery/rapport steps.
+- PRE-DISQUALIFICATION: Watch for moments where the rep objects on behalf of the prospect. This is a deal-killing behavior.`;
+
+    if (audioDelivery.critical_moments?.length) {
+      audioContext += `\n\nCritical Moments:\n${audioDelivery.critical_moments.map((m: any) => `- [${m.timestamp}] ${m.type || m.impact}: ${m.description} (rep response: ${m.rep_response_quality || 'N/A'})`).join('\n')}`;
+    }
+
+    if (audioDelivery.emotional_shifts?.length) {
+      audioContext += `\n\nEmotional Shifts:\n${audioDelivery.emotional_shifts.map((s: any) => `- [${s.timestamp}] ${s.shift || `${s.from_emotion}→${s.to_emotion}`} — trigger: ${s.trigger}`).join('\n')}`;
+    }
+
+    if (audioDelivery.visual_analysis) {
+      const v = audioDelivery.visual_analysis;
+      audioContext += `\n\nVisual Analysis: Eye contact: ${v.eye_contact_quality || v.eye_contact}, Body language: ${v.body_language}, Professionalism: ${v.professionalism || 'N/A'}`;
+      if (v.environment_notes || v.environment) audioContext += `, Environment: ${v.environment_notes || v.environment}`;
+    }
+  }
+
+  return `You are an expert sales call scoring analyst. Score this call using the "${rubric.name}" framework.
 
 Rep: ${callContext.rep_name || 'Unknown'}
 Prospect: ${callContext.contact_name || 'Unknown'}
@@ -370,8 +450,8 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure:
       "step_label": "string",
       "score": number,
       "max_score": number,
-      "reasoning": "string (2-3 sentences)",
-      "evidence": ["direct quote or timestamp"],
+      "reasoning": "string (2-3 sentences explaining the score with [mm:ss] timestamp references — if audio/video data is available, mention how delivery quality affected this step's score)",
+      "evidence": ["exact quote with [mm:ss] timestamp"],
       "adherence_percentage": number,
       "key_phrases_hit": ["string"],
       "key_phrases_missed": ["string"]
@@ -381,17 +461,44 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure:
     {
       "objection": "string",
       "handled_well": boolean,
-      "response_quality": "excellent|good|fair|poor",
-      "evidence": "string"
+      "response_quality": "excellent/good/fair/poor",
+      "evidence": "exact quote with [mm:ss] timestamp"
     }
   ],
   "strengths": ["string"],
   "improvements": ["string"],
-  "coaching_notes": "string",
-  "deal_killer": "string or null",
-  "coaching_fixes": ["string"],
-  "assigned_drill": "string or null"
+  "coaching_notes": "string (overall narrative coaching summary — be direct and specific about what happened and why the score is what it is)",
+  "deal_killer": {
+    "summary": "string (the single biggest reason this deal was lost or weakened)",
+    "timestamp": "[mm:ss]",
+    "quote": "exact words the rep said at that moment",
+    "what_to_do_instead": "string (specific alternative behavior with example language)"
+  },
+  "coaching_fixes": [
+    {
+      "issue": "string (what went wrong — include [mm:ss] timestamp and exact quote)",
+      "fix": "string (exact alternative behavior to practice, with example language)",
+      "script_reference": "string or null (which script/rubric section this maps to)"
+    }
+  ],
+  "assigned_drill": {
+    "name": "string (a memorable drill name like 'The 8-Second Torture', 'The Mirror Close', 'The Silence Challenge')",
+    "why": "string (which metric was weakest and exactly why this drill fixes it — reference specific data)"
+  }
 }
+
+CRITICAL SCORING RULES:
+1. TIMESTAMPS REQUIRED: Every piece of evidence, every quote, every reasoning reference MUST include [mm:ss] timestamps.
+2. SILENCE DISCIPLINE: If audio data shows talk_to_listen_ratio > 0.45 (rep talking >45%), penalize accordingly. If strategic_pauses = 0, flag it.
+3. PRE-DISQUALIFICATION DETECTION: If the rep objects FOR the prospect, flag it in deal_killer or coaching_fixes.
+4. DEAL KILLER: Always identify the single biggest moment that cost the deal or weakened the outcome. Be brutally honest.
+5. COACHING FIXES: Provide 2-4 specific, actionable fixes with timestamps. Each fix must have a concrete "do this instead" with example language.
+6. ASSIGNED DRILL: Based on the weakest metric, assign a specific practice drill.
+7. STRICT FORMAT: Each "coaching_fixes" entry MUST be a JSON object with "issue", "fix", and "script_reference" keys. NEVER return plain strings in the coaching_fixes array.
+8. "deal_killer" MUST be a JSON object with "summary", "timestamp", "quote", "what_to_do_instead". NEVER a plain string.
+9. "assigned_drill" MUST be a JSON object with "name" and "why". NEVER a plain string.
+
+Score fairly and specifically. Use exact transcript quotes as evidence. Be direct — not generic.
 
 CRITICAL OUTPUT FORMAT: Return ONLY the raw JSON object. Do NOT include markdown headers, code fences, explanatory text, or any content before or after the JSON. Your entire response must be valid JSON starting with { and ending with }.`;
 }
@@ -432,7 +539,10 @@ async function scoreTranscriptWithRetry(
         responseText = await callOpenRouter(apiKey, model, systemPrompt, userPrompt);
       }
 
-      return extractJSON(responseText);
+      const result = extractJSON(responseText);
+      // Normalize coaching data — ensure structured objects even if model returned plain strings
+      normalizeCoachingData(result);
+      return result;
     } catch (error) {
       console.error(
         `Scoring attempt ${attempt}/${MAX_SCORING_ATTEMPTS} failed:`,
@@ -552,15 +662,19 @@ async function sendRepNotification(
   if (!profiles?.[0]?.id) return;
 
   const grade =
-    scorePercentage >= 90 ? 'A' :
-    scorePercentage >= 80 ? 'B' :
-    scorePercentage >= 70 ? 'C' :
-    scorePercentage >= 60 ? 'D' : 'F';
+    scorePercentage >= 80 ? 'A' :
+    scorePercentage >= 65 ? 'B' :
+    scorePercentage >= 50 ? 'C' :
+    scorePercentage >= 35 ? 'D' : 'F';
 
   const severity = scorePercentage >= 80 ? 'success' : scorePercentage >= 50 ? 'warning' : 'error';
   const dealKiller = scoringResult.deal_killer;
   const topFix = Array.isArray(scoringResult.coaching_fixes) ? scoringResult.coaching_fixes[0] : null;
-  const takeaway = dealKiller ? `Deal killer: ${dealKiller}` : topFix ? `Top fix: ${topFix}` : '';
+  const takeaway = dealKiller
+    ? `Deal killer: ${typeof dealKiller === 'string' ? dealKiller : dealKiller.summary || JSON.stringify(dealKiller)}`
+    : topFix
+    ? `Top fix: ${typeof topFix === 'string' ? topFix : topFix.issue || JSON.stringify(topFix)}`
+    : '';
   const messageBody = takeaway ? `${takeaway} | call_id:${callId}` : `call_id:${callId}`;
 
   await supabaseFetch('/rest/v1/ai_insight_notifications', {

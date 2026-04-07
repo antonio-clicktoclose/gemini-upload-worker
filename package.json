@@ -12,7 +12,8 @@
     "pg": "^8.13.1",
     "@supabase/supabase-js": "^2.76.1",
     "express": "^4.21.1",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+     "undici": "^6.21.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

@@ -11,4 +11,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["node", "worker.js"]
+CMD ["npx","tsx","worker.ts"]

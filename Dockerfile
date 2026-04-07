@@ -1,16 +1,15 @@
-FROM node:20-slim
+FROM node:20-alpine
+
+# Install ffmpeg for audio extraction (audio_only mode)
+RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install --production=false
+RUN npm ci --production
 
-COPY tsconfig.json ./
-COPY src/ ./src/
-
-RUN npm run build
-RUN npm prune --production
+COPY . .
 
 EXPOSE 3000
 
-CMD ["node", "dist/worker.js"]
+CMD ["node", "worker.js"]

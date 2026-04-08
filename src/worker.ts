@@ -16,7 +16,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL ?? '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
 const POLL_INTERVAL_MS = 5_000;
 const MAX_RETRIES = 3;
-const VISIBILITY_TIMEOUT = 300;
+const VISIBILITY_TIMEOUT = 720;
 
 type MediaAnalysisMode = 'video_and_audio' | 'audio_only' | 'transcript_only';
 type AnalysisType = 'audio_and_transcript' | 'audio_only' | 'transcript_only';

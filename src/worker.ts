@@ -837,7 +837,6 @@ async function processJob(job: Record<string, any>): Promise<void> {
       scoring_model,
       scoring_provider,
     recording_external_id,
-    );
 
     // ── WRITE RESULTS ──
     const maxPossible = scoringResult.max_possible_score || rubric.max_total_score;

@@ -704,7 +704,7 @@ async function processJob(job: Record<string, any>): Promise<void> {
     sub_account_id,
     workspace_id,
     call_score_id,
-    recording_url,
+    recording_url: raw_recording_url,
     transcript,
     transcript_source,
     recording_id,
@@ -716,7 +716,35 @@ async function processJob(job: Record<string, any>): Promise<void> {
     scoring_api_key,
     scoring_model,
     scoring_provider,
+    recording_external_id,
   } = job;
+
+  // ── Refresh signed URL if we have an external bot ID ──
+  let recording_url = raw_recording_url;
+  if (recording_external_id && transcript_source !== 'fathom') {
+    try {
+      const ATTENDEE_API_URL = (process.env.ATTENDEE_API_URL || '').replace(/\/$/, '');
+      const ATTENDEE_API_KEY = process.env.ATTENDEE_API_KEY || '';
+      if (ATTENDEE_API_URL && ATTENDEE_API_KEY) {
+        console.log(`Refreshing signed URL for bot ${recording_external_id}...`);
+        const resp = await fetch(
+          `${ATTENDEE_API_URL}/api/v1/bots/${recording_external_id}/recording`,
+          { headers: { 'Authorization': `Token ${ATTENDEE_API_KEY}` } }
+        );
+        if (resp.ok) {
+          const data = (await resp.json()) as { url?: string };
+          if (data?.url) {
+            recording_url = data.url;
+            console.log('Recording URL refreshed successfully');
+          }
+        } else {
+          console.warn(`URL refresh failed (${resp.status}), using stored URL`);
+        }
+      }
+    } catch (err: any) {
+      console.warn('URL refresh error, using stored URL:', err.message);
+    }
+  }
 
   const requestedMode = normalizeMediaMode(job.media_analysis_mode);
   let effectiveMode: MediaAnalysisMode = requestedMode;
@@ -808,6 +836,7 @@ async function processJob(job: Record<string, any>): Promise<void> {
       scoring_api_key,
       scoring_model,
       scoring_provider,
+    recording_external_id,
     );
 
     // ── WRITE RESULTS ──

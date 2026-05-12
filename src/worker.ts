@@ -467,6 +467,18 @@ Scoring Steps:
 ${stepsDescription}
 ${audioContext}
 
+OBJECTION CATEGORIES (closed taxonomy — every entry in objections_detected MUST set "category" to exactly ONE of these):
+- price          — cost, too expensive, can't afford, ROI doubts
+- spouse_partner — needs to talk to spouse / partner / business partner
+- time           — too busy, bad timing, needs to think it over
+- trust          — skepticism, wants proof / guarantees, doubts credibility
+- fit            — "not right for me", unique situation, wrong stage
+- competition    — comparing to other providers / options
+- authority      — not the decision maker
+- urgency        — no rush, "why now?"
+- payment_terms  — financing, payment plan structure, deposit concerns
+- other          — only if it genuinely fits none of the above
+
 Return ONLY valid JSON (no markdown, no explanation) with this exact structure:
 {
   "overall_score": number,
@@ -488,7 +500,9 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure:
   ],
   "objections_detected": [
     {
-      "objection": "string",
+      "category": "price | spouse_partner | time | trust | fit | competition | authority | urgency | payment_terms | other",
+      "objection": "string (raw phrasing as the prospect said it)",
+      "quote": "short verbatim snippet from the prospect with [mm:ss] timestamp",
       "handled_well": boolean,
       "response_quality": "excellent/good/fair/poor",
       "evidence": "exact quote with [mm:ss] timestamp"

@@ -11,6 +11,188 @@ import {
   uploadFileToGemini,
   waitForFileActive,
 } from './scoring';
+import {
+  buildScoreBreakdown,
+  resolveFinalScore,
+  RUBRIC_SCORING_VERSION,
+  type QualificationColor,
+  type RubricConfig,
+} from './rubric-scoring';
+
+console.log(`[scoring-worker] rubric-scoring version: ${RUBRIC_SCORING_VERSION}`);
+
+
+// -------------------------------------------------------------
+// DIFF 2 — Extend AI contract in buildScoringSystemPrompt
+// -------------------------------------------------------------
+//
+// In worker.ts:387–503, the JSON-schema description block defines what
+// the AI must return. Add two NEW top-level keys to the schema and add
+// per-criterion HARD-FAIL annotations to the steps description.
+
+// REPLACE the steps mapping at line 389–394:
+
+function buildScoringSystemPrompt(
+  rubric: Record<string, any>,
+  callContext: Record<string, any>,
+  audioDelivery: any | null,
+): string {
+  const steps = Array.isArray(rubric.steps) ? rubric.steps : [];
+  const stepsDescription = steps
+    .map((step: Record<string, any>) => {
+      const criteria = Array.isArray(step.criteria)
+        ? step.criteria
+            .map((c: any) => {
+              if (typeof c === 'string') return c;
+              if (c && typeof c === 'object') {
+                const text = c.text || '';
+                if (c.hard_fail && c.hard_fail_id) {
+                  return `${text} [HARD-FAIL id=${c.hard_fail_id}]`;
+                }
+                return text;
+              }
+              return '';
+            })
+            .filter(Boolean)
+            .join(', ')
+        : '';
+      const phaseModNote = step.qualification_modifier
+        ? ` (phase modifiers: ${JSON.stringify(step.qualification_modifier)})`
+        : '';
+      return `- ${step.key} (${step.label}, max ${step.max_points} pts)${phaseModNote}: ${step.description}\n  Criteria: ${criteria}`;
+    })
+    .join('\n');
+
+  // ... existing audioContext block stays unchanged (lines 396–431) ...
+
+  // In the returned prompt body, ADD these two fields to the JSON schema
+  // (insert after "max_possible_score" / before "step_scores"):
+  //
+  //   "qualification_color": "GREEN | YELLOW | RED (your read of how qualified the prospect was — GREEN=highly qualified, YELLOW=mixed signals, RED=poor fit)",
+  //   "hard_fails_triggered": ["array of HARD-FAIL ids the rep tripped — only use ids shown in the criteria above; empty array if none"],
+  //
+  // And ADD to CRITICAL SCORING RULES:
+  //
+  //   10. QUALIFICATION COLOR: Always set qualification_color. Default to YELLOW if uncertain.
+  //   11. HARD-FAILS: Only return hard_fail ids that exactly match an [HARD-FAIL id=...] tag shown in the criteria. Return [] if nothing tripped.
+
+  // ...rest of function body unchanged
+}
+
+
+// -------------------------------------------------------------
+// DIFF 3 — Post-AI math hook (after scoreTranscriptWithRetry, before updateCallScore)
+// -------------------------------------------------------------
+//
+// In worker.ts:830–873, replace the block that computes scorePercentage
+// and writes to call_scores.
+//
+// ORIGINAL (lines 843–873):
+//   const maxPossible = scoringResult.max_possible_score || rubric.max_total_score;
+//   const scorePercentage = maxPossible > 0 ? Math.round((scoringResult.overall_score / maxPossible) * 100) : 0;
+//   ...
+//   await updateCallScore(call_score_id, { overall_score: scoringResult.overall_score, ... });
+//
+// REPLACE WITH:
+
+const rubricConfig: RubricConfig = {
+  advanced_scoring_enabled: rubric.advanced_scoring_enabled === true,
+  hard_fail_cap: rubric.hard_fail_cap ?? 49,
+  auto_bench_threshold: rubric.auto_bench_threshold ?? 70,
+  steps: rubric.steps || [],
+  max_total_score: rubric.max_total_score,
+};
+
+const aiQualColor: QualificationColor =
+  scoringResult.qualification_color === 'GREEN' ||
+  scoringResult.qualification_color === 'YELLOW' ||
+  scoringResult.qualification_color === 'RED'
+    ? scoringResult.qualification_color
+    : 'YELLOW';
+
+const aiHardFails: string[] = Array.isArray(scoringResult.hard_fails_triggered)
+  ? scoringResult.hard_fails_triggered.filter((x: any) => typeof x === 'string')
+  : [];
+
+const breakdown = buildScoreBreakdown(
+  rubricConfig,
+  Array.isArray(scoringResult.step_scores) ? scoringResult.step_scores : [],
+  aiQualColor,
+  aiHardFails,
+);
+
+const finalScore = resolveFinalScore(rubricConfig, breakdown);
+const maxPossible = finalScore.max_possible_score || scoringResult.max_possible_score || rubric.max_total_score;
+const scorePercentage = finalScore.score_percentage;
+
+const enrichedAudioDelivery = audioDelivery
+  ? {
+      ...audioDelivery,
+      deal_killer: scoringResult.deal_killer || null,
+      coaching_fixes: scoringResult.coaching_fixes || [],
+      assigned_drill: scoringResult.assigned_drill || null,
+    }
+  : null;
+
+await updateCallScore(call_score_id, {
+  overall_score: finalScore.overall_score,
+  max_possible_score: maxPossible,
+  // Always written — informational when toggle is off, authoritative when on
+  score_breakdown: breakdown,
+  hard_fail_triggered: rubricConfig.advanced_scoring_enabled ? breakdown.hard_fail_triggered : false,
+  hard_fail_reason: rubricConfig.advanced_scoring_enabled ? breakdown.hard_fail_reason : null,
+  analysis_type: analysisType,
+  audio_delivery: enrichedAudioDelivery,
+  objections_detected: scoringResult.objections_detected || [],
+  coaching_notes: scoringResult.coaching_notes || '',
+  strengths: scoringResult.strengths || [],
+  improvements: scoringResult.improvements || [],
+  transcript_source,
+  recording_id,
+  ai_provider: scoring_provider,
+  ai_model: scoring_model,
+  scored_by,
+  status: 'completed',
+  scored_at: new Date().toISOString(),
+  error_message: null,
+});
+
+
+// -------------------------------------------------------------
+// DIFF 4 — Phase B auto-bench hook (after Slack alert block)
+// -------------------------------------------------------------
+//
+// In worker.ts:931 (right after the Slack alert try/catch block,
+// before the closing `console.log(`Call ${call_id} scored...`)` line),
+// ADD:
+
+try {
+  if (
+    rubricConfig.advanced_scoring_enabled &&
+    rubric.coaching_calendar_id &&
+    !breakdown.hard_fail_triggered &&
+    scorePercentage < (rubricConfig.auto_bench_threshold ?? 70)
+  ) {
+    await supabaseFetch('/functions/v1/book-coaching-slot', {
+      method: 'POST',
+      body: JSON.stringify({
+        call_id,
+        call_score_id,
+        sub_account_id,
+        workspace_id,
+        rep_email: call_context?.rep_email,
+        contact_name: call_context?.contact_name,
+        score_percentage: scorePercentage,
+        coaching_calendar_id: rubric.coaching_calendar_id,
+        triggered_by: 'worker',
+      }),
+    });
+    console.log(`Auto-bench booking requested for call ${call_id} (${scorePercentage}% < ${rubricConfig.auto_bench_threshold}%)`);
+  }
+} catch (error) {
+  console.error('Auto-bench invocation failed (non-blocking):', error);
+}
+
 
 const SUPABASE_URL = process.env.SUPABASE_URL ?? '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';

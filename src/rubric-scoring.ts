@@ -9,7 +9,7 @@
 // Bump whenever scoring math changes. Both runtimes log this on boot;
 // ops verifies edge function + worker report the same value before
 // flipping any rubric to advanced_scoring_enabled = true.
-export const RUBRIC_SCORING_VERSION = "phaseA.1";
+export const RUBRIC_SCORING_VERSION = "phaseA.2";
 
 export type QualificationColor = "GREEN" | "YELLOW" | "RED";
 
@@ -107,6 +107,37 @@ export function applyPhaseModifiers(
 }
 
 /**
+ * Extract every hard-fail id known to the rubric. Used by applyHardFailCap to
+ * validate AI-returned ids without requiring structured criteria.
+ */
+export function extractHardFailIdsFromRubric(rubric: RubricConfig): Set<string> {
+  const ids = new Set<string>();
+  const tagRe = /\[HARD-?FAIL\s+id\s*=\s*([a-zA-Z0-9_-]+)\s*\]/gi;
+  const bareRe = /\bhf_[a-z0-9_]+/gi;
+  const scan = (s: unknown) => {
+    if (typeof s !== "string" || !s) return;
+    let m: RegExpExecArray | null;
+    tagRe.lastIndex = 0;
+    while ((m = tagRe.exec(s))) ids.add(m[1]);
+    bareRe.lastIndex = 0;
+    while ((m = bareRe.exec(s))) ids.add(m[0]);
+  };
+  for (const step of rubric.steps || []) {
+    scan(step.label);
+    scan((step as any).description);
+    for (const c of step.criteria || []) {
+      if (typeof c === "string") {
+        scan(c);
+      } else if (c && typeof c === "object") {
+        if (c.hard_fail && c.hard_fail_id) ids.add(c.hard_fail_id);
+        scan(c.text);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
  * Apply hard-fail cap. If any of the listed hard_fail ids are matched against
  * a criterion that has hard_fail=true, cap the score at rubric.hard_fail_cap.
  */
@@ -120,16 +151,12 @@ export function applyHardFailCap(
     return { cappedPct: rawPct, triggered: false, reason: null, cap };
   }
 
-  // Validate that each id corresponds to a criterion flagged hard_fail=true
-  // anywhere in the rubric. Unknown ids are ignored (defensive).
-  const validIds = new Set<string>();
-  for (const step of rubric.steps || []) {
-    for (const c of step.criteria || []) {
-      if (typeof c === "object" && c?.hard_fail && c.hard_fail_id) {
-        validIds.add(c.hard_fail_id);
-      }
-    }
-  }
+  // Validate against any hard-fail id known to the rubric. Sources:
+  //  1. Structured criteria objects with { hard_fail: true, hard_fail_id }
+  //  2. Explicit `[HARD-FAIL id=xxx]` tags injected by mapStepsForPrompt
+  //  3. Bare `hf_*` tokens mentioned anywhere in step description / label / criteria text
+  // Unknown ids are still ignored (defensive against AI hallucinations).
+  const validIds = extractHardFailIdsFromRubric(rubric);
   const matched = hardFailsTriggered.filter((id) => validIds.has(id));
   if (matched.length === 0) {
     return { cappedPct: rawPct, triggered: false, reason: null, cap };

@@ -9,9 +9,17 @@
 // Bump whenever scoring math changes. Both runtimes log this on boot;
 // ops verifies edge function + worker report the same value before
 // flipping any rubric to advanced_scoring_enabled = true.
-export const RUBRIC_SCORING_VERSION = "phaseA.2";
+export const RUBRIC_SCORING_VERSION = "phaseA.4";
 
 export type QualificationColor = "GREEN" | "YELLOW" | "RED";
+
+// A gate step's outcome type controls how the engine derives the outcome
+// value used to look up gate_branches. Two types are supported:
+//   - "pass_fail":            outcome is "pass" when AI score == max, else "fail"
+//   - "qualification_color":  outcome is the call's qualification_color (the
+//                             step's score is computed normally; the gate
+//                             reads the call-level color regardless)
+export type GateOutcomeType = "pass_fail" | "qualification_color";
 
 export interface RubricStep {
   key: string;
@@ -20,6 +28,16 @@ export interface RubricStep {
   // Optional per-phase qualification modifier — multiplies adjusted score
   // when the AI labels the prospect with this color. Missing = 1.0.
   qualification_modifier?: Partial<Record<QualificationColor, number>>;
+  // -- Gate steps -------------------------------------------------------
+  // When is_gate=true, this step's outcome decides which other steps are
+  // marked N/A (full credit, no AI drag, "N/A" pill on the scorecard).
+  // gate_branches maps each possible outcome value to a list of step keys.
+  // Empty/missing branch = no skips for that outcome.
+  is_gate?: boolean;
+  gate_outcome_type?: GateOutcomeType; // default "pass_fail"
+  gate_branches?: Record<string, string[]>;
+  // -- Legacy (no-op; kept to avoid breaking read of old rubrics) -------
+  applies_to_colors?: QualificationColor[];
   criteria?: Array<string | RubricCriterion>;
   [k: string]: unknown;
 }
@@ -50,6 +68,10 @@ export interface ScoreBreakdownPhase {
   adjusted_score: number;
   modifier: number;
   max_score: number;
+  // Present only when the step was skipped by an upstream gate.
+  // When true: adjusted_score == max_score (full credit, no drag).
+  skipped?: boolean;
+  skip_reason?: string;
 }
 
 export interface ScoreBreakdown {
@@ -81,8 +103,61 @@ function modifierFor(step: RubricStep, color: QualificationColor): number {
 }
 
 /**
+ * Determine a gate step's outcome value for this call.
+ * - qualification_color gates: returns the call's color
+ * - pass_fail gates: "pass" if score == max, else "fail"
+ */
+function resolveGateOutcome(
+  step: RubricStep,
+  scoreInput: StepScoreInput | undefined,
+  qualificationColor: QualificationColor,
+): string {
+  const type: GateOutcomeType = step.gate_outcome_type === "qualification_color"
+    ? "qualification_color"
+    : "pass_fail";
+  if (type === "qualification_color") return qualificationColor;
+  const score = Number(scoreInput?.score) || 0;
+  const max = Number(scoreInput?.max_score) || step.max_points || 0;
+  if (max <= 0) return "pass";
+  return score >= max ? "pass" : "fail";
+}
+
+/**
+ * Walk gate steps in order and return a Map of skipped step keys → reason.
+ * First gate to skip a given step wins for skip_reason attribution.
+ * Defensive: a gate step can never skip itself or a step before it.
+ */
+export function computeSkippedStepIds(
+  steps: RubricStep[],
+  scoresByKey: Map<string, StepScoreInput>,
+  qualificationColor: QualificationColor,
+): Map<string, string> {
+  const skipped = new Map<string, string>();
+  const stepIndex = new Map<string, number>();
+  steps.forEach((s, i) => stepIndex.set(s.key, i));
+
+  steps.forEach((step, gateIdx) => {
+    if (!step.is_gate || !step.gate_branches) return;
+    const outcome = resolveGateOutcome(step, scoresByKey.get(step.key), qualificationColor);
+    const targets = step.gate_branches[outcome];
+    if (!Array.isArray(targets) || targets.length === 0) return;
+    const reason = `${step.label || step.key} → ${outcome}`;
+    for (const targetKey of targets) {
+      if (typeof targetKey !== "string" || !targetKey) continue;
+      if (targetKey === step.key) continue; // gates can't skip themselves
+      const targetIdx = stepIndex.get(targetKey);
+      if (targetIdx === undefined || targetIdx <= gateIdx) continue; // forward only
+      if (!skipped.has(targetKey)) skipped.set(targetKey, reason);
+    }
+  });
+
+  return skipped;
+}
+
+/**
  * Apply per-phase qualification modifiers to AI step scores.
  * Returns adjusted phase rows (raw + adjusted side-by-side).
+ * Steps marked skipped by an upstream gate are returned with full credit.
  */
 export function applyPhaseModifiers(
   steps: RubricStep[],
@@ -90,11 +165,26 @@ export function applyPhaseModifiers(
   qualificationColor: QualificationColor,
 ): ScoreBreakdownPhase[] {
   const stepByKey = new Map(steps.map((s) => [s.key, s]));
+  const scoresByKey = new Map(stepScores.map((s) => [s.step_key, s]));
+  const skippedMap = computeSkippedStepIds(steps, scoresByKey, qualificationColor);
+
   return stepScores.map((s) => {
     const step = stepByKey.get(s.step_key);
+    const max = Number(s.max_score) || step?.max_points || 0;
+    const skipReason = skippedMap.get(s.step_key);
+    if (skipReason) {
+      return {
+        step_key: s.step_key,
+        raw_score: max,
+        adjusted_score: max,
+        modifier: 1,
+        max_score: max,
+        skipped: true,
+        skip_reason: skipReason,
+      };
+    }
     const modifier = step ? modifierFor(step, qualificationColor) : 1;
     const raw = Number(s.score) || 0;
-    const max = Number(s.max_score) || step?.max_points || 0;
     const adjusted = Math.min(max, raw * modifier);
     return {
       step_key: s.step_key,
@@ -151,11 +241,6 @@ export function applyHardFailCap(
     return { cappedPct: rawPct, triggered: false, reason: null, cap };
   }
 
-  // Validate against any hard-fail id known to the rubric. Sources:
-  //  1. Structured criteria objects with { hard_fail: true, hard_fail_id }
-  //  2. Explicit `[HARD-FAIL id=xxx]` tags injected by mapStepsForPrompt
-  //  3. Bare `hf_*` tokens mentioned anywhere in step description / label / criteria text
-  // Unknown ids are still ignored (defensive against AI hallucinations).
   const validIds = extractHardFailIdsFromRubric(rubric);
   const matched = hardFailsTriggered.filter((id) => validIds.has(id));
   if (matched.length === 0) {
@@ -227,8 +312,6 @@ export function resolveFinalScore(
       score_percentage: pct,
     };
   }
-  // Convert adjusted_percentage back to a points value so existing
-  // consumers that read overall_score continue to work.
   const points = max > 0 ? (breakdown.adjusted_percentage / 100) * max : 0;
   return {
     overall_score: Math.round(points * 100) / 100,

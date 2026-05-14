@@ -9,7 +9,34 @@
 // Bump whenever scoring math changes. Both runtimes log this on boot;
 // ops verifies edge function + worker report the same value before
 // flipping any rubric to advanced_scoring_enabled = true.
-export const RUBRIC_SCORING_VERSION = "phaseA.4";
+export const RUBRIC_SCORING_VERSION = "phaseB.1";
+
+/**
+ * Worker version-mismatch guard. The edge function stamps this version onto
+ * every job payload it enqueues to `scoring_jobs`. The external worker calls
+ * this on dequeue — if the worker's vendored copy of rubric-scoring.ts is on
+ * a different version than what produced the payload, scoring math will
+ * differ. We log loudly so ops sees it without trawling boot logs.
+ *
+ * Returns true if versions match, false otherwise. Worker should still
+ * proceed (don't fail the job — operator decides), but the [VERSION MISMATCH]
+ * line will trip alerts.
+ */
+export function assertScoringVersionOrWarn(payloadVersion: string | null | undefined): boolean {
+  if (!payloadVersion) {
+    console.warn(
+      `[VERSION MISMATCH] payload missing rubric_scoring_version; worker is ${RUBRIC_SCORING_VERSION}`,
+    );
+    return false;
+  }
+  if (payloadVersion !== RUBRIC_SCORING_VERSION) {
+    console.error(
+      `[VERSION MISMATCH] payload=${payloadVersion} worker=${RUBRIC_SCORING_VERSION} — redeploy worker or edge function to align`,
+    );
+    return false;
+  }
+  return true;
+}
 
 export type QualificationColor = "GREEN" | "YELLOW" | "RED";
 
@@ -48,10 +75,20 @@ export interface RubricCriterion {
   hard_fail_id?: string;
 }
 
+export type HardFailMode = "cap" | "deduct" | "flag_only";
+
+export interface HardFailModeConfig {
+  mode: HardFailMode;
+  /** Only honored when mode === "deduct". Percentage points to subtract. */
+  points?: number;
+}
+
 export interface RubricConfig {
   advanced_scoring_enabled?: boolean;
   hard_fail_cap?: number; // default 49
   auto_bench_threshold?: number; // default 70
+  /** Per-id mode override. Missing entries default to { mode: "cap" }. */
+  hard_fail_modes?: Record<string, HardFailModeConfig>;
   steps: RubricStep[];
   max_total_score?: number;
 }
@@ -84,7 +121,12 @@ export interface ScoreBreakdown {
   hard_fail_triggered: boolean;
   hard_fail_reason: string | null;
   hard_fails_triggered: string[];
+  /** Cap value applied (when any cap-mode hard-fail fired), else null. */
   cap_applied: number | null;
+  /** Total percentage points subtracted by deduct-mode hard-fails, else null. */
+  deduction_applied: number | null;
+  /** Map of triggered id → resolved mode. Empty when none triggered. */
+  hard_fail_modes: Record<string, HardFailMode>;
   phases: ScoreBreakdownPhase[];
 }
 
@@ -197,39 +239,115 @@ export function applyPhaseModifiers(
 }
 
 /**
- * Extract every hard-fail id known to the rubric. Used by applyHardFailCap to
- * validate AI-returned ids without requiring structured criteria.
+ * Extract every hard-fail id known to the rubric.
+ *
+ * STRICT: only ids declared by structured criteria
+ * (`{ hard_fail: true, hard_fail_id: "..." }`) count. Bare `hf_*` mentions
+ * and `[HARD-FAIL id=...]` tags in step descriptions or string criteria are
+ * ignored — they're prompt scaffolding for the AI, not contracts the engine
+ * should treat as authoritative. Removing every structured criterion from a
+ * rubric must mean "no hard fails."
  */
 export function extractHardFailIdsFromRubric(rubric: RubricConfig): Set<string> {
   const ids = new Set<string>();
-  const tagRe = /\[HARD-?FAIL\s+id\s*=\s*([a-zA-Z0-9_-]+)\s*\]/gi;
-  const bareRe = /\bhf_[a-z0-9_]+/gi;
-  const scan = (s: unknown) => {
-    if (typeof s !== "string" || !s) return;
-    let m: RegExpExecArray | null;
-    tagRe.lastIndex = 0;
-    while ((m = tagRe.exec(s))) ids.add(m[1]);
-    bareRe.lastIndex = 0;
-    while ((m = bareRe.exec(s))) ids.add(m[0]);
-  };
   for (const step of rubric.steps || []) {
-    scan(step.label);
-    scan((step as any).description);
     for (const c of step.criteria || []) {
-      if (typeof c === "string") {
-        scan(c);
-      } else if (c && typeof c === "object") {
-        if (c.hard_fail && c.hard_fail_id) ids.add(c.hard_fail_id);
-        scan(c.text);
+      if (c && typeof c === "object" && c.hard_fail === true && c.hard_fail_id) {
+        ids.add(c.hard_fail_id);
       }
     }
   }
   return ids;
 }
 
+interface HardFailResolution {
+  adjustedPct: number;
+  triggered: boolean;
+  reason: string | null;
+  cap_applied: number | null;
+  deduction_applied: number | null;
+  modes_triggered: Record<string, HardFailMode>;
+}
+
 /**
- * Apply hard-fail cap. If any of the listed hard_fail ids are matched against
- * a criterion that has hard_fail=true, cap the score at rubric.hard_fail_cap.
+ * Resolve hard-fails against the rubric and apply per-id modes.
+ * Order: deduct → cap (if any cap-mode fired) → floor at 0.
+ * `flag_only` ids are recorded but do not touch the score.
+ */
+export function applyHardFails(
+  rubric: RubricConfig,
+  adjustedPct: number,
+  hardFailsTriggered: string[],
+): HardFailResolution {
+  const cap = rubric.hard_fail_cap ?? DEFAULT_HARD_FAIL_CAP;
+  const empty: HardFailResolution = {
+    adjustedPct,
+    triggered: false,
+    reason: null,
+    cap_applied: null,
+    deduction_applied: null,
+    modes_triggered: {},
+  };
+  if (!hardFailsTriggered || hardFailsTriggered.length === 0) return empty;
+
+  const validIds = extractHardFailIdsFromRubric(rubric);
+  const matched = hardFailsTriggered.filter((id) => validIds.has(id));
+  if (matched.length === 0) return empty;
+
+  const modes = rubric.hard_fail_modes || {};
+  const modesTriggered: Record<string, HardFailMode> = {};
+  let totalDeduct = 0;
+  let anyCap = false;
+
+  for (const id of matched) {
+    const cfg = modes[id];
+    const mode: HardFailMode = cfg?.mode === "deduct" || cfg?.mode === "flag_only"
+      ? cfg.mode
+      : "cap";
+    modesTriggered[id] = mode;
+    if (mode === "cap") {
+      anyCap = true;
+    } else if (mode === "deduct") {
+      const pts = Number(cfg?.points);
+      if (Number.isFinite(pts) && pts > 0) totalDeduct += pts;
+    }
+  }
+
+  let next = adjustedPct;
+  const deductionApplied = totalDeduct > 0 ? totalDeduct : null;
+  if (deductionApplied !== null) next = next - deductionApplied;
+  let capApplied: number | null = null;
+  if (anyCap && next > cap) {
+    next = cap;
+    capApplied = cap;
+  } else if (anyCap) {
+    capApplied = cap;
+  }
+  if (next < 0) next = 0;
+
+  const reasonParts = matched.map((id) => {
+    const m = modesTriggered[id];
+    if (m === "deduct") {
+      const pts = Number(modes[id]?.points);
+      return `${id} (-${Number.isFinite(pts) && pts > 0 ? pts : 0}pt)`;
+    }
+    if (m === "flag_only") return `${id} (flag)`;
+    return `${id} (cap)`;
+  });
+
+  return {
+    adjustedPct: next,
+    triggered: true,
+    reason: `Hard fail: ${reasonParts.join(", ")}`,
+    cap_applied: capApplied,
+    deduction_applied: deductionApplied,
+    modes_triggered: modesTriggered,
+  };
+}
+
+/**
+ * @deprecated Back-compat wrapper around applyHardFails. New callers should
+ * use applyHardFails directly to access deduction_applied / modes_triggered.
  */
 export function applyHardFailCap(
   rubric: RubricConfig,
@@ -237,19 +355,8 @@ export function applyHardFailCap(
   hardFailsTriggered: string[],
 ): { cappedPct: number; triggered: boolean; reason: string | null; cap: number } {
   const cap = rubric.hard_fail_cap ?? DEFAULT_HARD_FAIL_CAP;
-  if (!hardFailsTriggered || hardFailsTriggered.length === 0) {
-    return { cappedPct: rawPct, triggered: false, reason: null, cap };
-  }
-
-  const validIds = extractHardFailIdsFromRubric(rubric);
-  const matched = hardFailsTriggered.filter((id) => validIds.has(id));
-  if (matched.length === 0) {
-    return { cappedPct: rawPct, triggered: false, reason: null, cap };
-  }
-  if (rawPct <= cap) {
-    return { cappedPct: rawPct, triggered: true, reason: `Hard fail: ${matched.join(", ")}`, cap };
-  }
-  return { cappedPct: cap, triggered: true, reason: `Hard fail: ${matched.join(", ")}`, cap };
+  const r = applyHardFails(rubric, rawPct, hardFailsTriggered);
+  return { cappedPct: r.adjustedPct, triggered: r.triggered, reason: r.reason, cap };
 }
 
 /**
@@ -276,19 +383,21 @@ export function buildScoreBreakdown(
 
   const rawPct = maxTotal > 0 ? (rawTotal / maxTotal) * 100 : 0;
   const adjustedPctUncapped = maxTotal > 0 ? (adjustedTotal / maxTotal) * 100 : 0;
-  const cap = applyHardFailCap(rubric, adjustedPctUncapped, fails);
+  const resolved = applyHardFails(rubric, adjustedPctUncapped, fails);
 
   return {
     raw_total: rawTotal,
     adjusted_total: adjustedTotal,
     max_total: maxTotal,
     raw_percentage: clampPct(Math.round(rawPct * 100) / 100),
-    adjusted_percentage: clampPct(Math.round(cap.cappedPct * 100) / 100),
+    adjusted_percentage: clampPct(Math.round(resolved.adjustedPct * 100) / 100),
     qualification_color: color,
-    hard_fail_triggered: cap.triggered,
-    hard_fail_reason: cap.reason,
+    hard_fail_triggered: resolved.triggered,
+    hard_fail_reason: resolved.reason,
     hard_fails_triggered: fails,
-    cap_applied: cap.triggered ? cap.cap : null,
+    cap_applied: resolved.cap_applied,
+    deduction_applied: resolved.deduction_applied,
+    hard_fail_modes: resolved.modes_triggered,
     phases,
   };
 }

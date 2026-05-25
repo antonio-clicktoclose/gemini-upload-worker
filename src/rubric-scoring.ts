@@ -9,7 +9,12 @@
 // Bump whenever scoring math changes. Both runtimes log this on boot;
 // ops verifies edge function + worker report the same value before
 // flipping any rubric to advanced_scoring_enabled = true.
-export const RUBRIC_SCORING_VERSION = "phaseB.1";
+//
+// phaseB.2 — fix: applyPhaseModifiers now iterates rubric.steps (authoritative)
+// instead of AI stepScores (unreliable). The AI's per-step max_score is ignored;
+// rubric.max_points is used exclusively. This eliminates the denominator drift
+// (62–128 instead of 111) caused by AI key mismatches and gate-skip miscounting.
+export const RUBRIC_SCORING_VERSION = "phaseB.2";
 
 /**
  * Worker version-mismatch guard. The edge function stamps this version onto
@@ -36,6 +41,30 @@ export function assertScoringVersionOrWarn(payloadVersion: string | null | undef
     return false;
   }
   return true;
+}
+
+/**
+ * Fail-closed version guard for consumers (workers).
+ *
+ * Throws on mismatch — the caller doesn't process the job; pgmq redelivers
+ * after the visibility timeout. Makes silent drift impossible (the
+ * worn-out lesson from v8.9, where the worker stayed on phaseB.1 while the
+ * edge fn moved to phaseB.2 for weeks, silently mis-scoring every job).
+ *
+ * Use this in the worker's processJob entry point. Producers (the edge fn)
+ * don't call this — they stamp `rubric_scoring_version` into the payload.
+ */
+export function assertScoringVersionOrThrow(payloadVersion: string | null | undefined): void {
+  if (!payloadVersion) {
+    throw new Error(
+      `[VERSION MISMATCH] payload missing rubric_scoring_version; worker is ${RUBRIC_SCORING_VERSION}. Job will redeliver until producer is aligned.`,
+    );
+  }
+  if (payloadVersion !== RUBRIC_SCORING_VERSION) {
+    throw new Error(
+      `[VERSION MISMATCH] payload=${payloadVersion} worker=${RUBRIC_SCORING_VERSION}. Redeploy worker or producer to align. Job will redeliver until then.`,
+    );
+  }
 }
 
 export type QualificationColor = "GREEN" | "YELLOW" | "RED";
@@ -159,7 +188,8 @@ function resolveGateOutcome(
     : "pass_fail";
   if (type === "qualification_color") return qualificationColor;
   const score = Number(scoreInput?.score) || 0;
-  const max = Number(scoreInput?.max_score) || step.max_points || 0;
+  // Use the rubric's declared max_points for gate pass/fail, not the AI's max_score.
+  const max = step.max_points || 0;
   if (max <= 0) return "pass";
   return score >= max ? "pass" : "fail";
 }
@@ -198,25 +228,50 @@ export function computeSkippedStepIds(
 
 /**
  * Apply per-phase qualification modifiers to AI step scores.
- * Returns adjusted phase rows (raw + adjusted side-by-side).
- * Steps marked skipped by an upstream gate are returned with full credit.
+ * Returns one ScoreBreakdownPhase per RUBRIC step (not per AI step).
+ *
+ * KEY DESIGN: This function iterates rubric.steps (authoritative), not stepScores
+ * (AI output). The AI frequently returns invented step_key names or extra phantom
+ * steps that don't match the rubric. By anchoring iteration to the rubric:
+ *
+ *   1. Every rubric step always appears in the breakdown — no phantom steps,
+ *      no missing steps.
+ *   2. Gate skips fire against rubric positions (correct indices), not against
+ *      whatever the AI happened to return.
+ *   3. The authoritative max_points from the rubric is always used — the AI's
+ *      per-step max_score is ignored entirely, preventing denominator drift.
+ *
+ * If the AI returned a score for a step_key not in the rubric, that score is
+ * silently discarded (the unknown key had no meaningful rubric backing anyway).
+ *
+ * Steps marked skipped by an upstream gate are returned with full credit
+ * (adjusted_score = max_score), so they don't drag the percentage down.
  */
 export function applyPhaseModifiers(
   steps: RubricStep[],
   stepScores: StepScoreInput[],
   qualificationColor: QualificationColor,
 ): ScoreBreakdownPhase[] {
-  const stepByKey = new Map(steps.map((s) => [s.key, s]));
+  // Build lookup by rubric step key → AI-reported score.
+  // NOTE: we only use the AI's `score` (numerator), never its `max_score`.
   const scoresByKey = new Map(stepScores.map((s) => [s.step_key, s]));
   const skippedMap = computeSkippedStepIds(steps, scoresByKey, qualificationColor);
 
-  return stepScores.map((s) => {
-    const step = stepByKey.get(s.step_key);
-    const max = Number(s.max_score) || step?.max_points || 0;
-    const skipReason = skippedMap.get(s.step_key);
+  // Iterate the rubric's authoritative step list. This guarantees:
+  //   - One entry per rubric step (no phantom AI steps inflate the denominator)
+  //   - Gate skip logic fires against correct rubric-defined positions
+  //   - max_score in each phase row = rubric max_points (never AI-drifted value)
+  return steps.map((step) => {
+    const max = Number(step.max_points) || 0;
+    const aiScore = scoresByKey.get(step.key);
+    const raw = Number(aiScore?.score) || 0;
+    const skipReason = skippedMap.get(step.key);
+
     if (skipReason) {
+      // Skipped steps get full credit — they were conditionally N/A for this call,
+      // so they should not drag the score. Use the rubric's declared max as the credit.
       return {
-        step_key: s.step_key,
+        step_key: step.key,
         raw_score: max,
         adjusted_score: max,
         modifier: 1,
@@ -225,11 +280,11 @@ export function applyPhaseModifiers(
         skip_reason: skipReason,
       };
     }
-    const modifier = step ? modifierFor(step, qualificationColor) : 1;
-    const raw = Number(s.score) || 0;
+
+    const modifier = modifierFor(step, qualificationColor);
     const adjusted = Math.min(max, raw * modifier);
     return {
-      step_key: s.step_key,
+      step_key: step.key,
       raw_score: raw,
       adjusted_score: adjusted,
       modifier,
@@ -374,12 +429,22 @@ export function buildScoreBreakdown(
   const color: QualificationColor = enabled ? qualificationColor : "GREEN";
   const fails = enabled ? hardFailsTriggered : [];
 
+  // applyPhaseModifiers now iterates rubric.steps (not stepScores), so phases
+  // always has exactly one entry per rubric step with authoritative max_points.
   const phases = applyPhaseModifiers(rubric.steps || [], stepScores, color);
   const rawTotal = phases.reduce((acc, p) => acc + p.raw_score, 0);
   const adjustedTotal = phases.reduce((acc, p) => acc + p.adjusted_score, 0);
-  const maxTotal = phases.reduce((acc, p) => acc + p.max_score, 0)
-    || rubric.max_total_score
-    || 0;
+
+  // Denominator: rubric.max_total_score is authoritative. Declared step sum is
+  // the verified fallback (phases now uses rubric max_points so aiPhaseMax ==
+  // declaredStepMax when phases are complete). AI phase sum is last resort only.
+  const rubricMax = Number(rubric.max_total_score) || 0;
+  const declaredStepMax = (rubric.steps || []).reduce(
+    (acc, s) => acc + (Number(s.max_points) || 0),
+    0,
+  );
+  const aiPhaseMax = phases.reduce((acc, p) => acc + p.max_score, 0);
+  const maxTotal = rubricMax || declaredStepMax || aiPhaseMax || 0;
 
   const rawPct = maxTotal > 0 ? (rawTotal / maxTotal) * 100 : 0;
   const adjustedPctUncapped = maxTotal > 0 ? (adjustedTotal / maxTotal) * 100 : 0;
@@ -414,9 +479,13 @@ export function resolveFinalScore(
   const enabled = rubric.advanced_scoring_enabled === true;
   const max = breakdown.max_total;
   if (!enabled) {
-    const pct = max > 0 ? Math.round((breakdown.raw_total / max) * 100) : 0;
+    // The AI can return per-step scores summing above the rubric's fixed max
+    // (it over-allocates max_score per step). Clamp so overall_score never
+    // exceeds max_possible_score and the percentage stays within 0–100.
+    const overall = Math.min(breakdown.raw_total, max);
+    const pct = max > 0 ? clampPct(Math.round((overall / max) * 100)) : 0;
     return {
-      overall_score: breakdown.raw_total,
+      overall_score: overall,
       max_possible_score: max,
       score_percentage: pct,
     };

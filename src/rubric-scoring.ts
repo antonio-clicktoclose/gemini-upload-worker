@@ -14,7 +14,14 @@
 // instead of AI stepScores (unreliable). The AI's per-step max_score is ignored;
 // rubric.max_points is used exclusively. This eliminates the denominator drift
 // (62–128 instead of 111) caused by AI key mismatches and gate-skip miscounting.
-export const RUBRIC_SCORING_VERSION = "phaseB.2";
+//
+// phaseC.0 — change of input source: scoring math now reads from the
+// historical scoring_rubric_versions snapshot effective at call time, not
+// from the live scoring_rubrics row. Editing a rubric no longer retroactively
+// re-scores past calls. The producer (score-sales-call edge fn) resolves the
+// version via rubric_version_at(rubric_id, call.appointment_datetime) and
+// embeds the version content in the worker payload.
+export const RUBRIC_SCORING_VERSION = "phaseC.0";
 
 /**
  * Worker version-mismatch guard. The edge function stamps this version onto

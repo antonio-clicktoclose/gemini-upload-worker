@@ -12,6 +12,7 @@ import {
   waitForFileActive,
 } from './scoring';
 import {
+  assertScoringVersionOrThrow,
   buildScoreBreakdown,
   resolveFinalScore,
   RUBRIC_SCORING_VERSION,
@@ -744,6 +745,11 @@ async function sendRepNotification(
 // ============================================================
 
 async function processJob(job: Record<string, any>): Promise<void> {
+  // Fail-closed version guard. Throws on mismatch; pgmq redelivers after the
+  // visibility timeout so ops can fix the alignment without losing the job.
+  // Silent drift cost us delivery-quality analysis for weeks pre-v8.9 — never again.
+  assertScoringVersionOrThrow(job.rubric_scoring_version);
+
   const {
     call_id,
     sub_account_id,
